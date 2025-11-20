@@ -1,0 +1,19 @@
+name: telegram-bot-khaminh
+services:
+  - name: telegram-bot
+    type: web
+    plan: free
+    build:
+      type: dockerfile
+      dockerfile: Dockerfile
+    ports:
+      - port: 8000
+        protocol: http
+    environment:
+      - name: BOT_TOKEN
+        secret: BOT_TOKEN
+    healthCheck:
+      path: /health
+      port: 8000
+      initialDelay: 30
+      period: 60
