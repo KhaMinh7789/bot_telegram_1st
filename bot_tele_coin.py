@@ -6,13 +6,17 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters, CallbackQueryHandler
 import aiohttp
 import random
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ================== CẤU HÌNH ==================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-BOT_TOKEN = '8345772573:AAEiSg1E7l7BpgvL0qUcN65FVZgkp5ypZLE'
-GEMINI_API_KEY = 'AIzaSyBrfga0ca6cFkzmVMiRkxesxbB8lALDvhc'
-TAVILY_API_KEY = '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'
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+TAVILY_API_KEY = os.getenv('TAVILY_API_KEY')
 BINANCE_API = 'https://api.binance.com/api/v3'
 SYMBOL = 'LINKUSDT'
 
