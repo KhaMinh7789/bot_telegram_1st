@@ -6,7 +6,4 @@ asyncio
 logging
 datetime
 random
-Flask
-pyTelegramBotAPI
-schedule
 python-dotenv
