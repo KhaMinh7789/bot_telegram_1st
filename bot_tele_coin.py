@@ -254,7 +254,7 @@ async def analyze_link(symbol=SYMBOL):
     logging.info(f"🔍 Bắt đầu phân tích {symbol}...")
     
     # Lấy dữ liệu klines
-    klines = await get_year_klines(symbol)
+    klines = await BinanceAPI.get_year_klines(symbol)
     if not klines:
         error_msg = "❌ Không thể kết nối đến Binance để lấy dữ liệu lịch sử. Vui lòng thử lại sau!"
         logging.error(error_msg)
