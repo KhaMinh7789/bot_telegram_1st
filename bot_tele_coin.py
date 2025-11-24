@@ -1407,6 +1407,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ================== MAIN ==================
 def main():
+    asyncio.run(initialize_sentiment_analyzer())
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
