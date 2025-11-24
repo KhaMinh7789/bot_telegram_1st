@@ -738,7 +738,7 @@ async def calculate_price_probability(symbol, target_price):
     """
     try:
         # Lấy dữ liệu 1 năm
-        klines = await get_year_klines(symbol)
+        klines = await BinanceAPI.get_year_klines(symbol)
         if not klines:
             return None, "Không lấy được dữ liệu từ Binance!"
         
