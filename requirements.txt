@@ -1,9 +1,5 @@
-python-telegram-bot>=20.0
-aiohttp>=3.8.0
+python-telegram-bot
+aiohttp
 numpy
 requests
-asyncio
-logging
-datetime
-random
 python-dotenv
