@@ -3,3 +3,8 @@ aiohttp
 numpy
 requests
 python-dotenv
+pandas
+transformers
+torch
+textblob
+matplotlib

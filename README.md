@@ -1,0 +1,1 @@
+Cho AI: Input (Tin tức) → Tiền xử lý → Model Sentiment → Phân tích → Output (Score + Hành động)

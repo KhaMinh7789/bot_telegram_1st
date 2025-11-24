@@ -8,6 +8,14 @@ import aiohttp
 import random
 import os
 from dotenv import load_dotenv
+import pandas as pd
+from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
+import torch
+from textblob import TextBlob
+import re
+from collections import defaultdict
+import matplotlib.pyplot as plt
+import io
 
 load_dotenv()
 
@@ -24,18 +32,13 @@ SYMBOL = 'LINKUSDT'
 subscribed_link_users = {}
 subscribed_gold_users = set()
 chat_histories = {}
-user_last_sent = {}  # Sửa lỗi: biến toàn cục cho last_sent
-
-# ================== TÍNH NĂNG MỚI: PRICE ALERTS ==================
-price_alerts = {}  # {chat_id: [{"symbol": "LINKUSDT", "target_price": 15.0, "condition": "above/below", "active": True}, ...]}
-
-# ================== TÍNH NĂNG MỚI: PORTFOLIO TRACKING ==================
-user_portfolios = {}  # {chat_id: [{"symbol": "LINKUSDT", "amount": 100, "buy_price": 13.5, "current_price": 14.0}, ...]}
-
-# ================== TÍNH NĂNG MỚI: MARKET NEWS ==================
+user_last_sent = {}
+price_alerts = {}  
+user_portfolios = {}
 last_news_cache = {}
-
 last_gold_price = None
+sentiment_analyzer = None
+market_sentiment_history = []
 
 # ================== TAVILY SEARCH ==================
 class TavilySearch:
@@ -248,6 +251,155 @@ Cập nhật: {data['time']}
 {datetime.now().strftime('%H:%M • %d/%m/%Y')}
     """.strip()
 
+# ================== REAL-TIME NEWS SENTIMENT ANALYZER ==================
+class NewsSentimentAnalyzer:
+    def __init__(self):
+        self.sentiment_pipeline = None
+        self.tokenizer = None
+        self.model = None
+        self.sentiment_history = []
+        self.crypto_keywords = [
+            'bitcoin', 'btc', 'ethereum', 'eth', 'crypto', 'cryptocurrency',
+            'blockchain', 'defi', 'nft', 'mining', 'halving', 'bull', 'bear',
+            'market', 'trading', 'investment', 'regulation', 'sec', 'fomo', 'fud'
+        ]
+        self.load_models()
+    
+    def load_models(self):
+        """Tải model sentiment analysis"""
+        try:
+            # Model chính: FinBERT cho tài chính
+            self.sentiment_pipeline = pipeline(
+                "sentiment-analysis",
+                model="ProsusAI/finbert",
+                tokenizer="ProsusAI/finbert",
+                max_length=512,
+                truncation=True
+            )
+            print("✅ Đã tải FinBERT model")
+        except Exception as e:
+            print(f"❌ Lỗi tải FinBERT: {e}")
+            # Fallback model
+            self.sentiment_pipeline = pipeline("sentiment-analysis")
+            print("✅ Đã tải model sentiment dự phòng")
+    
+    def preprocess_text(self, text):
+        """Làm sạch và chuẩn hóa văn bản"""
+        # Loại bỏ HTML tags, URLs, special characters
+        text = re.sub(r'http\S+', '', text)
+        text = re.sub(r'[^\w\s]', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip().lower()
+        return text
+    
+    def extract_crypto_context(self, text):
+        """Trích xuất ngữ cảnh crypto từ văn bản"""
+        text_lower = text.lower()
+        found_keywords = [kw for kw in self.crypto_keywords if kw in text_lower]
+        
+        # Xác định chủ đề chính
+        if any(kw in text_lower for kw in ['bitcoin', 'btc']):
+            primary_topic = 'Bitcoin'
+        elif any(kw in text_lower for kw in ['ethereum', 'eth']):
+            primary_topic = 'Ethereum'
+        elif any(kw in text_lower for kw in ['regulation', 'sec', 'law']):
+            primary_topic = 'Regulation'
+        elif any(kw in text_lower for kw in ['defi', 'nft']):
+            primary_topic = 'DeFi/NFT'
+        else:
+            primary_topic = 'Crypto General'
+        
+        return {
+            'keywords': found_keywords,
+            'primary_topic': primary_topic,
+            'crypto_relevance': len(found_keywords) / len(self.crypto_keywords) * 100
+        }
+    
+    def analyze_sentiment(self, text):
+        """Phân tích sentiment chính"""
+        try:
+            # Phân tích với model chính
+            result = self.sentiment_pipeline(text[:1000])[0]  # Giới hạn độ dài
+            label = result['label']
+            score = result['score']
+            
+            # Chuẩn hóa nhãn sentiment
+            if label in ['positive', 'Positive']:
+                sentiment = 'POSITIVE'
+                numeric_score = score
+            elif label in ['negative', 'Negative']:
+                sentiment = 'NEGATIVE'
+                numeric_score = -score
+            else:  # neutral
+                sentiment = 'NEUTRAL'
+                numeric_score = 0
+            
+            return {
+                'sentiment': sentiment,
+                'score': numeric_score,
+                'confidence': score,
+                'text_snippet': text[:200] + '...' if len(text) > 200 else text
+            }
+        except Exception as e:
+            print(f"❌ Lỗi phân tích sentiment: {e}")
+            return {
+                'sentiment': 'NEUTRAL',
+                'score': 0,
+                'confidence': 0,
+                'text_snippet': text[:200] + '...' if len(text) > 200 else text
+            }
+    
+    def calculate_market_sentiment_index(self, sentiment_data_list):
+        """Tính chỉ số sentiment tổng quan thị trường"""
+        if not sentiment_data_list:
+            return 0
+        
+        total_score = sum(data['score'] for data in sentiment_data_list)
+        avg_score = total_score / len(sentiment_data_list)
+        
+        # Chuẩn hóa về thang điểm -100 đến 100
+        market_sentiment = (avg_score + 1) * 50  # Chuyển từ [-1,1] sang [0,100]
+        return max(-100, min(100, market_sentiment))
+    
+    def generate_trading_signal(self, sentiment_index, trend="stable"):
+        """Tạo tín hiệu giao dịch dựa trên sentiment"""
+        if sentiment_index >= 70:
+            signal = "🟢 BULLISH STRONG"
+            action = "Có thể mua/Bottom fishing"
+            confidence = "CAO"
+        elif sentiment_index >= 40:
+            signal = "🟡 BULLISH WEAK" 
+            action = "Theo dõi thêm"
+            confidence = "TRUNG BÌNH"
+        elif sentiment_index >= -40:
+            signal = "⚪ NEUTRAL"
+            action = "Chờ tín hiệu rõ hơn"
+            confidence = "THẤP"
+        elif sentiment_index >= -70:
+            signal = "🟠 BEARISH WEAK"
+            action = "Cẩn thận, có thể take profit"
+            confidence = "TRUNG BÌNH"
+        else:
+            signal = "🔴 BEARISH STRONG"
+            action = "Có thể bán/Short"
+            confidence = "CAO"
+        
+        return {
+            'signal': signal,
+            'action': action,
+            'confidence': confidence,
+            'index': sentiment_index
+        }
+
+# ================== KHỞI TẠO SENTIMENT ANALYZER ==================
+async def initialize_sentiment_analyzer():
+    global sentiment_analyzer
+    try:
+        sentiment_analyzer = NewsSentimentAnalyzer()
+        print("✅ Đã khởi tạo Sentiment Analyzer")
+    except Exception as e:
+        print(f"❌ Lỗi khởi tạo Sentiment Analyzer: {e}")
+        sentiment_analyzer = None
+
 # ================== DỰ BÁO LINK CHI TIẾT ==================
 async def analyze_link(symbol=SYMBOL):
     # Thông báo đang xử lý
@@ -406,12 +558,58 @@ async def check_price_alerts(context: ContextTypes.DEFAULT_TYPE):
 
 # ================== TÍNH NĂNG MỚI: MARKET NEWS ==================
 async def get_crypto_news():
-    """Lấy tin tức crypto mới nhất"""
+    """Lấy tin tức crypto kèm phân tích sentiment"""
     try:
-        news_data = await TavilySearch.search("tin tức cryptocurrency bitcoin ethereum blockchain mới nhất")
-        return news_data
+        # Lấy tin tức từ Tavily
+        news_data = await TavilySearch.search("tin tức cryptocurrency bitcoin ethereum blockchain mới nhất 24h")
+        
+        # Nếu có dữ liệu tin tức, phân tích sentiment
+        if news_data and "Không tìm thấy" not in news_data:
+            # Tách các tin thành list
+            news_items = news_data.split('• ')
+            sentiment_results = []
+            
+            for item in news_items[1:]:  # Bỏ phần header
+                if item.strip():
+                    # Phân tích sentiment cho mỗi tin
+                    sentiment_result = sentiment_analyzer.analyze_sentiment(item)
+                    context = sentiment_analyzer.extract_crypto_context(item)
+                    
+                    sentiment_results.append({
+                        'content': item[:150] + '...' if len(item) > 150 else item,
+                        'sentiment': sentiment_result,
+                        'context': context
+                    })
+            
+            # Tính sentiment tổng thể
+            if sentiment_results:
+                market_sentiment = sentiment_analyzer.calculate_market_sentiment_index(
+                    [r['sentiment'] for r in sentiment_results]
+                )
+                trading_signal = sentiment_analyzer.generate_trading_signal(market_sentiment)
+                
+                # Lưu lịch sử
+                market_sentiment_history.append({
+                    'timestamp': datetime.now(),
+                    'sentiment_index': market_sentiment,
+                    'signal': trading_signal
+                })
+                
+                # Giữ lịch sử trong 100 bản ghi
+                if len(market_sentiment_history) > 100:
+                    market_sentiment_history.pop(0)
+                
+                return {
+                    'news_items': sentiment_results,
+                    'market_sentiment': market_sentiment,
+                    'trading_signal': trading_signal,
+                    'total_news': len(sentiment_results)
+                }
+        
+        return None
     except Exception as e:
-        return f"Không thể lấy tin tức: {str(e)}"
+        logging.error(f"❌ Lỗi phân tích sentiment tin tức: {e}")
+        return None
 
 # ================== LỆNH ==================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -725,11 +923,34 @@ async def remove_position_command(update: Update, context: ContextTypes.DEFAULT_
 
 # ================== TÍNH NĂNG MỚI: MARKET NEWS ==================
 async def news_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tin tức crypto mới nhất"""
-    await update.message.reply_text("📰 Đang lấy tin tức mới nhất...")
+    """Tin tức crypto với phân tích sentiment"""
+    await update.message.reply_text("📰 Đang lấy tin tức và phân tích sentiment...")
     
-    news = await get_crypto_news()
-    await update.message.reply_text(f"📊 **TIN TỨC CRYPTO MỚI NHẤT**\n\n{news}")
+    sentiment_data = await get_crypto_news()
+    
+    if not sentiment_data:
+        await update.message.reply_text("❌ Không thể lấy tin tức hoặc phân tích sentiment.")
+        return
+    
+    # Format message với sentiment
+    message = "📰 **TIN TỨC CRYPTO + SENTIMENT**\n\n"
+    
+    # Thêm sentiment overview
+    message += f"🎯 **SENTIMENT TỔNG THỂ:** {sentiment_data['market_sentiment']:.1f}/100\n"
+    message += f"📢 **TÍN HIỆU:** {sentiment_data['trading_signal']['signal']}\n\n"
+    
+    # Thêm tin tức chi tiết với sentiment
+    for i, item in enumerate(sentiment_data['news_items'][:4], 1):
+        sentiment_emoji = "🟢" if item['sentiment']['sentiment'] == 'POSITIVE' else "🔴" if item['sentiment']['sentiment'] == 'NEGATIVE' else "🟡"
+        confidence = item['sentiment']['confidence'] * 100
+        
+        message += f"{sentiment_emoji} **[{item['sentiment']['sentiment']} - {confidence:.0f}%]**\n"
+        message += f"{item['content']}\n"
+        message += f"🔗 Chủ đề: {item['context']['primary_topic']}\n\n"
+    
+    message += "💡 Dùng /sentiment để phân tích chi tiết hơn!"
+    
+    await update.message.reply_text(message)
 
 # ================== TÍNH NĂNG MỚI: PRICE PROBABILITY PREDICTION ==================
 async def calculate_price_probability(symbol, target_price):
@@ -995,10 +1216,150 @@ async def test_api_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response, _ = await SuperAI.ask("Xin chào, hãy trả lời bằng 1 câu ngắn", [])
     await update.message.reply_text(f"Kết quả: {response}")
 
+async def sentiment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Phân tích sentiment tin tức thời gian thực"""
+    processing_msg = await update.message.reply_text("📊 Đang phân tích sentiment thị trường...")
+    
+    try:
+        sentiment_data = await get_crypto_news()
+        
+        if not sentiment_data:
+            await processing_msg.edit_text("❌ Không thể lấy dữ liệu sentiment.")
+            return
+        
+        # Tạo message chi tiết
+        message = "🎯 **PHÂN TÍCH SENTIMENT THỊ TRƯỜNG**\n\n"
+        
+        # Hiển thị sentiment tổng thể
+        sentiment_index = sentiment_data['market_sentiment']
+        signal = sentiment_data['trading_signal']
+        
+        message += f"📈 **CHỈ SỐ SENTIMENT:** {sentiment_index:.1f}/100\n"
+        message += f"📢 **TÍN HIỆU:** {signal['signal']}\n"
+        message += f"💡 **HÀNH ĐỘNG:** {signal['action']}\n"
+        message += f"🎲 **ĐỘ TIN CẬY:** {signal['confidence']}\n\n"
+        
+        # Hiển thị các tin tiêu biểu
+        message += "📰 **TIN TỨC NỔI BẬT:**\n"
+        
+        positive_news = [n for n in sentiment_data['news_items'] if n['sentiment']['sentiment'] == 'POSITIVE']
+        negative_news = [n for n in sentiment_data['news_items'] if n['sentiment']['sentiment'] == 'NEGATIVE']
+        
+        if positive_news[:2]:
+            message += "\n🟢 **TÍCH CỰC:**\n"
+            for news in positive_news[:2]:
+                emoji = "🚀" if news['sentiment']['score'] > 0.7 else "📈"
+                message += f"{emoji} {news['content']}\n\n"
+        
+        if negative_news[:2]:
+            message += "\n🔴 **TIÊU CỰC:**\n"
+            for news in negative_news[:2]:
+                emoji = "💥" if news['sentiment']['score'] < -0.7 else "📉"
+                message += f"{emoji} {news['content']}\n\n"
+        
+        message += f"\n⏰ Cập nhật: {datetime.now().strftime('%H:%M %d/%m/%Y')}"
+        
+        await processing_msg.edit_text(message)
+        
+    except Exception as e:
+        await processing_msg.edit_text(f"❌ Lỗi phân tích: {str(e)}")
+
+async def sentiment_chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Hiển thị biểu đồ sentiment theo thời gian"""
+    if len(market_sentiment_history) < 3:
+        await update.message.reply_text("📊 Chưa có đủ dữ liệu để vẽ biểu đồ. Thử lại sau ít phút.")
+        return
+    
+    try:
+        # Tạo biểu đồ
+        timestamps = [entry['timestamp'] for entry in market_sentiment_history]
+        sentiment_values = [entry['sentiment_index'] for entry in market_sentiment_history]
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(timestamps, sentiment_values, marker='o', linewidth=2, color='#FF6B00')
+        plt.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
+        plt.fill_between(timestamps, sentiment_values, 0, where=(np.array(sentiment_values) >= 0), 
+                        alpha=0.3, color='green', interpolate=True)
+        plt.fill_between(timestamps, sentiment_values, 0, where=(np.array(sentiment_values) < 0), 
+                        alpha=0.3, color='red', interpolate=True)
+        
+        plt.title('DIỄN BIẾN SENTIMENT THỊ TRƯỜNG', fontsize=14, fontweight='bold')
+        plt.ylabel('Chỉ số Sentiment')
+        plt.grid(True, alpha=0.3)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        # Lưu biểu đồ vào buffer
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        buf.seek(0)
+        plt.close()
+        
+        # Gửi biểu đồ
+        current_sentiment = market_sentiment_history[-1]['sentiment_index']
+        caption = f"📊 Biểu đồ Sentiment - Hiện tại: {current_sentiment:.1f}/100"
+        
+        await update.message.reply_photo(
+            photo=buf,
+            caption=caption
+        )
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Lỗi tạo biểu đồ: {str(e)}")
+
+async def alert_sentiment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cảnh báo khi sentiment thay đổi mạnh"""
+    if len(market_sentiment_history) < 2:
+        await update.message.reply_text("📊 Chưa có đủ dữ liệu để thiết lập cảnh báo.")
+        return
+    
+    current = market_sentiment_history[-1]['sentiment_index']
+    previous = market_sentiment_history[-2]['sentiment_index']
+    change = current - previous
+    
+    if abs(change) >= 30:  # Thay đổi lớn
+        if change > 0:
+            alert_msg = f"🚨 SENTIMENT TĂNG MẠNH: +{change:.1f} điểm\n"
+            alert_msg += f"📈 Từ {previous:.1f} lên {current:.1f}\n"
+            alert_msg += "💡 Thị trường đang tích cực hơn!"
+        else:
+            alert_msg = f"🚨 SENTIMENT GIẢM MẠNH: {change:.1f} điểm\n"
+            alert_msg += f"📉 Từ {previous:.1f} xuống {current:.1f}\n"
+            alert_msg += "⚠️ Thị trường đang tiêu cực hơn!"
+        
+        await update.message.reply_text(alert_msg)
+    else:
+        await update.message.reply_text(f"📊 Sentiment ổn định: {change:.1f} điểm thay đổi")
+
+async def auto_sentiment_analysis(context: ContextTypes.DEFAULT_TYPE):
+    """Tự động phân tích sentiment mỗi 30 phút"""
+    try:
+        sentiment_data = await get_crypto_news_with_sentiment()
+        if sentiment_data and sentiment_data['market_sentiment'] <= -60:
+            # Gửi cảnh báo nếu sentiment quá tiêu cực
+            warning_msg = f"🚨 CẢNH BÁO SENTIMENT THẤP!\n\n"
+            warning_msg += f"📉 Chỉ số: {sentiment_data['market_sentiment']:.1f}/100\n"
+            warning_msg += f"📢 Tín hiệu: {sentiment_data['trading_signal']['signal']}\n"
+            warning_msg += f"💡 Hành động: {sentiment_data['trading_signal']['action']}"
+            
+            # Gửi cho tất cả user đang subscribe
+            for chat_id in list(subscribed_link_users.keys()):
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=warning_msg)
+                except Exception as e:
+                    logging.error(f"❌ Lỗi gửi cảnh báo sentiment cho {chat_id}: {e}")
+    except Exception as e:
+        logging.error(f"❌ Lỗi auto sentiment analysis: {e}")
+
 # Thêm lệnh vào help_command
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("""
-🤖 BOT LINK + VÀNG + AI 24/7
+🤖 BOT LINK + VÀNG + AI + SENTIMENT 24/7
+
+🎯 SENTIMENT ANALYSIS (MỚI):
+/sentiment → phân tích sentiment thị trường
+/sentiment_chart → biểu đồ sentiment
+/alert_sentiment → cảnh báo thay đổi sentiment
 
 📊 LINK/USDT:
 /start → chọn thời gian nhận báo cáo
@@ -1065,11 +1426,17 @@ def main():
     app.add_handler(CommandHandler("remove_position", remove_position_command))
     app.add_handler(CommandHandler("news", news_command))
     app.add_handler(CommandHandler("probability", probability_command))
+    # Thêm handlers cho sentiment analysis
+    app.add_handler(CommandHandler("sentiment", sentiment_command))
+    app.add_handler(CommandHandler("sentiment_chart", sentiment_chart_command))
+    app.add_handler(CommandHandler("alert_sentiment", alert_sentiment_command))
     
     app.add_handler(CommandHandler("chat", chat_command))
     app.add_handler(CommandHandler("clear_chat", clear_chat_command))
     app.add_handler(CommandHandler("test_api", test_api_command))
     app.add_handler(CommandHandler("help", help_command))
+
+    
     
     # Thêm handler cho inline keyboard
     app.add_handler(CallbackQueryHandler(handle_time_selection, pattern="^(60|300|600|1800|3600|21600|43200|86400)$"))
@@ -1078,8 +1445,9 @@ def main():
     jq.run_repeating(send_personal_analysis, interval=55, first=10)
     jq.run_repeating(send_gold_price, interval=300, first=15)
     jq.run_repeating(check_price_alerts, interval=30, first=20)  # Kiểm tra alerts mỗi 30 giây
+    jq.run_repeating(auto_sentiment_analysis, interval=1800, first=60)  # 30 phút
 
-    print("🤖 Bot đã chạy với 3 tính năng mới: Price Alerts, Portfolio Tracking, Market News!")
+    print("🤖 Bot đã chạy!")
     app.run_polling()
 
 if __name__ == '__main__':
